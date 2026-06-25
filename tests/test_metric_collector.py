@@ -3,7 +3,7 @@ import time
 from collectors.metric_collector import (
     _parse_rtt, normalize_latency,
     normalize_load, normalize_loss,
-    BfdMonitor,
+    BfdMonitor, SyslogListener,
 )
 from unittest.mock import AsyncMock, patch
 
@@ -272,3 +272,47 @@ class TestBfdMonitor:
             await monitor.poll()
 
         assert monitor.get_flap_count() == 0
+
+class TestSyslogListener:
+    """Тесты SyslogListener — парсинг syslog-сообщений."""
+
+    def test_bfd_down_фиксируется(self):
+        """BFD adjacency down → событие записывается в BfdMonitor."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        listener = SyslogListener(bfd_monitor=monitor)
+
+        listener._handle_message(
+            "<189>: %BGP-5-ADJCHANGE: neighbor 10.0.24.1 Down BFD adjacency down"
+        )
+
+        assert monitor.get_flap_count() == 1
+
+    def test_обычное_сообщение_не_считается(self):
+        """Обычный syslog без BFD → событие не записывается."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        listener = SyslogListener(bfd_monitor=monitor)
+
+        listener._handle_message(
+            "<189>: %SYS-5-CONFIG_I: Configured from console by console"
+        )
+
+        assert monitor.get_flap_count() == 0
+
+    def test_несколько_событий(self):
+        """Два BFD события → два flap."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        listener = SyslogListener(bfd_monitor=monitor)
+
+        listener._handle_message("<189>: %BGP-5-ADJCHANGE: neighbor Down BFD adjacency down")
+        listener._handle_message("<189>: %BGP-5-NBR_RESET: Neighbor reset BFD adjacency down")
+
+        assert monitor.get_flap_count() == 2
+
+    def test_m4_после_события(self):
+        """После одного BFD события m4 = 0.8 (при max_flaps=5)."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        listener = SyslogListener(bfd_monitor=monitor)
+
+        listener._handle_message("<189>: %BGP-5-ADJCHANGE: neighbor Down BFD adjacency down")
+
+        assert monitor.get_m4() == pytest.approx(0.8)

@@ -5,6 +5,8 @@ import logging
 import puresnmp
 import time
 from collections import deque
+import socketserver
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -301,3 +303,68 @@ class BfdMonitor:
         except Exception as exc:
             logger.warning("BFD SNMP ошибка для %s: %s", self.host, exc)
             return {}
+
+class SyslogListener:
+    """Слушает UDP syslog на порту 514 и фиксирует BFD-события.
+
+    Когда роутер шлёт сообщение о падении BFD-сессии —
+    записываем timestamp в BfdMonitor.
+
+    Args:
+        bfd_monitor: Экземпляр BfdMonitor куда пишем события.
+        host: IP на котором слушаем (по умолчанию все интерфейсы).
+        port: UDP порт (по умолчанию 514).
+    """
+
+    # Ключевые слова в syslog которые говорят о падении BFD
+    BFD_DOWN_KEYWORDS = [
+        "BFD adjacency down",
+        "BFD_SESS_DESTROYED",
+        "BFD adjacency changed",
+    ]
+
+    def __init__(
+        self,
+        bfd_monitor: BfdMonitor,
+        host: str = "0.0.0.0",
+        port: int = 514,
+    ) -> None:
+        self.bfd_monitor = bfd_monitor
+        self.host = host
+        self.port = port
+        self._server: Optional[socketserver.UDPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Запустить syslog-сервер в фоновом потоке."""
+        listener = self  # передаём себя в handler через замыкание
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self) -> None:
+                data = self.request[0].decode(errors="ignore")
+                listener._handle_message(data)
+
+        self._server = socketserver.UDPServer((self.host, self.port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        logger.info("SyslogListener запущен на %s:%d", self.host, self.port)
+
+    def stop(self) -> None:
+        """Остановить syslog-сервер."""
+        if self._server:
+            self._server.shutdown()
+            logger.info("SyslogListener остановлен")
+
+    def _handle_message(self, message: str) -> None:
+        """Обработать входящее syslog-сообщение.
+
+        Args:
+            message: Текст syslog-сообщения от роутера.
+        """
+        logger.debug("Syslog: %s", message.strip())
+
+        for keyword in self.BFD_DOWN_KEYWORDS:
+            if keyword in message:
+                logger.info("BFD событие зафиксировано: %s", message.strip())
+                self.bfd_monitor._flap_times.append(time.time())
+                break
