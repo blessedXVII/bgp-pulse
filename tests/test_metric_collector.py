@@ -1,6 +1,6 @@
 import pytest
 from collectors.metric_collector import (
-    _parse_rtt, normalize_latency, normalize_load
+    _parse_rtt, normalize_latency, normalize_load, normalize_loss
 )
 from unittest.mock import AsyncMock, patch
 
@@ -112,3 +112,92 @@ class TestMeasureLoad:
             )
 
         assert result is None
+
+class TestNormalizeLoss:
+    """Тесты нормировки потерь → m3."""
+
+    def test_нет_потерь(self):
+        assert normalize_loss(0.0) == pytest.approx(1.0)
+
+    def test_все_потеряны(self):
+        assert normalize_loss(1.0) == pytest.approx(0.0)
+
+    def test_половина(self):
+        assert normalize_loss(0.5) == pytest.approx(0.5)
+
+
+class TestMeasureLoss:
+    """Тесты measure_loss с моком SNMP."""
+
+    @pytest.mark.asyncio
+    async def test_нет_потерь(self):
+        """Нет ошибок и дропов → потери 0.0."""
+        # errors не изменились, discards не изменились,
+        # пакетов пришло 1000 за интервал
+        snmp_values = [
+            0,      # err1
+            0,      # dis1
+            1000,   # pkt1
+            0,      # err2
+            0,      # dis2
+            2000,   # pkt2
+        ]
+        with patch(
+            "collectors.metric_collector._snmp_get",
+            new_callable=AsyncMock,
+            side_effect=snmp_values,
+        ):
+            from collectors.metric_collector import measure_loss
+            result = await measure_loss("10.0.42.1", if_index=1)
+
+        assert result == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_есть_потери(self):
+        """100 ошибок из 1100 пакетов → потери ~0.09."""
+        snmp_values = [
+            0,      # err1
+            0,      # dis1
+            1000,   # pkt1
+            100,    # err2
+            0,      # dis2
+            2000,   # pkt2
+        ]
+        with patch(
+            "collectors.metric_collector._snmp_get",
+            new_callable=AsyncMock,
+            side_effect=snmp_values,
+        ):
+            from collectors.metric_collector import measure_loss
+            result = await measure_loss("10.0.42.1", if_index=1)
+
+        # bad=100, total=1000+100=1100 → 100/1100 ≈ 0.0909
+        assert result == pytest.approx(100 / 1100)
+
+    @pytest.mark.asyncio
+    async def test_нет_трафика(self):
+        """Трафика не было → потери 0.0, не делим на ноль."""
+        snmp_values = [0, 0, 1000, 0, 0, 1000]
+        with patch(
+            "collectors.metric_collector._snmp_get",
+            new_callable=AsyncMock,
+            side_effect=snmp_values,
+        ):
+            from collectors.metric_collector import measure_loss
+            result = await measure_loss("10.0.42.1", if_index=1)
+
+        assert result == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_snmp_недоступен(self):
+        """SNMP не отвечает → None."""
+        with patch(
+            "collectors.metric_collector._snmp_get",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            from collectors.metric_collector import measure_loss
+            result = await measure_loss("10.0.42.1", if_index=1)
+
+        assert result is None
+

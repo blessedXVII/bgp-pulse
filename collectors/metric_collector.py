@@ -142,3 +142,70 @@ def normalize_load(utilization: float) -> float:
         m1 = 1 - утилизация.
     """
     return 1.0 - utilization
+
+# OID счётчиков ошибок и дропов
+OID_IF_IN_ERRORS = "1.3.6.1.2.1.2.2.1.14"    # входящие ошибки
+OID_IF_IN_DISCARDS = "1.3.6.1.2.1.2.2.1.13"  # входящие дропы
+OID_IF_IN_UCAST = "1.3.6.1.2.1.2.2.1.11"     # входящие пакеты (всего)
+
+
+async def measure_loss(
+    host: str,
+    if_index: int,
+    interval_sec: float = 1.0,
+) -> float | None:
+    """Замерить потери пакетов на интерфейсе через SNMP.
+
+    Считает долю ошибочных и дропнутых пакетов от общего числа
+    за интервал между двумя снимками.
+
+    Args:
+        host: IP-адрес роутера.
+        if_index: Индекс интерфейса (ifIndex).
+        interval_sec: Интервал между снимками в секундах.
+
+    Returns:
+        Доля потерь 0..1 или None если SNMP недоступен.
+        0.0 = нет потерь, 1.0 = все пакеты потеряны.
+    """
+    oid_errors = f"{OID_IF_IN_ERRORS}.{if_index}"
+    oid_discards = f"{OID_IF_IN_DISCARDS}.{if_index}"
+    oid_ucast = f"{OID_IF_IN_UCAST}.{if_index}"
+
+    # Первый снимок
+    err1 = await _snmp_get(host, oid_errors)
+    dis1 = await _snmp_get(host, oid_discards)
+    pkt1 = await _snmp_get(host, oid_ucast)
+
+    if any(v is None for v in (err1, dis1, pkt1)):
+        return None
+
+    await asyncio.sleep(interval_sec)
+
+    # Второй снимок
+    err2 = await _snmp_get(host, oid_errors)
+    dis2 = await _snmp_get(host, oid_discards)
+    pkt2 = await _snmp_get(host, oid_ucast)
+
+    if any(v is None for v in (err2, dis2, pkt2)):
+        return None
+
+    bad = (err2 - err1) + (dis2 - dis1)   # плохие пакеты за интервал
+    total = (pkt2 - pkt1) + bad            # всего пакетов за интервал
+
+    if total == 0:
+        return 0.0  # трафика не было — потерь нет
+
+    return min(1.0, bad / total)
+
+
+def normalize_loss(loss_ratio: float) -> float:
+    """Нормировать потери в метрику m3 (0..1, где 1 = лучшее).
+
+    Args:
+        loss_ratio: Доля потерь 0..1 (0 = нет потерь, 1 = все потеряны).
+
+    Returns:
+        m3 = 1 - loss_ratio.
+    """
+    return 1.0 - loss_ratio
