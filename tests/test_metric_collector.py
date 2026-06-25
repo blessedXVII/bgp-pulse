@@ -3,7 +3,7 @@ import time
 from collectors.metric_collector import (
     _parse_rtt, normalize_latency,
     normalize_load, normalize_loss,
-    BfdMonitor, SyslogListener,
+    BfdMonitor, SyslogListener, RawMetrics,
 )
 from unittest.mock import AsyncMock, patch
 
@@ -316,3 +316,75 @@ class TestSyslogListener:
         listener._handle_message("<189>: %BGP-5-ADJCHANGE: neighbor Down BFD adjacency down")
 
         assert monitor.get_m4() == pytest.approx(0.8)
+
+class TestCollect:
+    """Тесты функции collect() — параллельный сбор метрик."""
+
+    @pytest.mark.asyncio
+    async def test_все_источники_работают(self):
+        """Все метрики собраны — возвращает RawMetrics с данными."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+
+        with patch("collectors.metric_collector.measure_load", new_callable=AsyncMock, return_value=0.3), \
+             patch("collectors.metric_collector.measure_latency", new_callable=AsyncMock, return_value=50.0), \
+             patch("collectors.metric_collector.measure_loss", new_callable=AsyncMock, return_value=0.02):
+
+            from collectors.metric_collector import collect
+            raw = await collect(
+                host_r2="10.0.42.1",
+                host_r4="10.0.44.1",
+                if_index=1,
+                max_bandwidth_bps=10_000_000,
+                bfd_monitor=monitor,
+            )
+
+        assert raw.load_utilization == pytest.approx(0.3)
+        assert raw.latency_ms == pytest.approx(50.0)
+        assert raw.loss_ratio == pytest.approx(0.02)
+        assert raw.m4 == pytest.approx(1.0)
+        assert raw.timestamp > 0
+
+    @pytest.mark.asyncio
+    async def test_один_источник_упал(self):
+        """Если SNMP недоступен — load=None, остальные метрики работают."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+
+        with patch("collectors.metric_collector.measure_load", new_callable=AsyncMock, return_value=None), \
+             patch("collectors.metric_collector.measure_latency", new_callable=AsyncMock, return_value=30.0), \
+             patch("collectors.metric_collector.measure_loss", new_callable=AsyncMock, return_value=0.0):
+
+            from collectors.metric_collector import collect
+            raw = await collect(
+                host_r2="10.0.42.1",
+                host_r4="10.0.44.1",
+                if_index=1,
+                max_bandwidth_bps=10_000_000,
+                bfd_monitor=monitor,
+            )
+
+        assert raw.load_utilization is None
+        assert raw.latency_ms == pytest.approx(30.0)
+        assert raw.loss_ratio == pytest.approx(0.0)
+
+    @pytest.mark.asyncio
+    async def test_все_источники_упали(self):
+        """Все источники недоступны — все метрики None кроме m4."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+
+        with patch("collectors.metric_collector.measure_load", new_callable=AsyncMock, return_value=None), \
+             patch("collectors.metric_collector.measure_latency", new_callable=AsyncMock, return_value=None), \
+             patch("collectors.metric_collector.measure_loss", new_callable=AsyncMock, return_value=None):
+
+            from collectors.metric_collector import collect
+            raw = await collect(
+                host_r2="10.0.42.1",
+                host_r4="10.0.44.1",
+                if_index=1,
+                max_bandwidth_bps=10_000_000,
+                bfd_monitor=monitor,
+            )
+
+        assert raw.load_utilization is None
+        assert raw.latency_ms is None
+        assert raw.loss_ratio is None
+        assert raw.m4 == pytest.approx(1.0)  # m4 из памяти, всегда есть

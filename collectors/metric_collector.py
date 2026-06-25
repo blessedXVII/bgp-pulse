@@ -7,6 +7,7 @@ import time
 from collections import deque
 import socketserver
 import threading
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -368,3 +369,73 @@ class SyslogListener:
                 logger.info("BFD событие зафиксировано: %s", message.strip())
                 self.bfd_monitor._flap_times.append(time.time())
                 break
+
+
+@dataclass
+class RawMetrics:
+    """Сырые измерения по каналу до нормировки.
+
+    Все значения могут быть None если источник недоступен.
+    """
+    timestamp: float
+    load_utilization: Optional[float]  # 0..1
+    latency_ms: Optional[float]  # мс
+    loss_ratio: Optional[float]  # 0..1
+    m4: Optional[float]  # 0..1 уже нормированная
+
+
+async def collect(
+        host_r2: str,
+        host_r4: str,
+        if_index: int,
+        max_bandwidth_bps: float,
+        bfd_monitor: BfdMonitor,
+) -> RawMetrics:
+    """Собрать все метрики параллельно через asyncio.gather.
+
+    m1, m2, m3 запускаются одновременно — сбор не блокируется
+    из-за медленного источника. Если источник недоступен —
+    возвращает None для этой метрики, не роняет всю систему.
+
+    Args:
+        host_r2: IP роутера для SNMP и ping.
+        host_r4: IP роутера для BFD.
+        if_index: Индекс интерфейса для SNMP.
+        max_bandwidth_bps: Максимальная пропускная способность в бит/с.
+        bfd_monitor: Экземпляр BfdMonitor для m4.
+
+    Returns:
+        RawMetrics с сырыми значениями и timestamp.
+    """
+    ts = time.time()
+
+    # Запускаем m1, m2, m3 параллельно
+    load, rtt, loss = await asyncio.gather(
+        measure_load(host_r2, if_index=if_index, max_bandwidth_bps=max_bandwidth_bps),
+        measure_latency(host_r2),
+        measure_loss(host_r2, if_index=if_index),
+        return_exceptions=False,
+    )
+
+    # m4 из BfdMonitor (синхронно — просто читаем память)
+    m4 = bfd_monitor.get_m4()
+
+    raw = RawMetrics(
+        timestamp=ts,
+        load_utilization=load,
+        latency_ms=rtt,
+        loss_ratio=loss,
+        m4=m4,
+    )
+
+    # Логируем сырые измерения перед нормировкой
+    logger.info(
+        "Сырые метрики | timestamp=%.3f | load=%.4f | rtt=%.3f мс | loss=%.4f | m4=%.3f",
+        raw.timestamp,
+        raw.load_utilization if raw.load_utilization is not None else -1,
+        raw.latency_ms if raw.latency_ms is not None else -1,
+        raw.loss_ratio if raw.loss_ratio is not None else -1,
+        raw.m4 if raw.m4 is not None else -1,
+    )
+
+    return raw
