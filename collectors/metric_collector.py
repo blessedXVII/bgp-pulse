@@ -2,6 +2,8 @@ import asyncio
 import re
 import logging
 import puresnmp
+import time
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +211,92 @@ def normalize_loss(loss_ratio: float) -> float:
         m3 = 1 - loss_ratio.
     """
     return 1.0 - loss_ratio
+
+# OID состояния BFD-сессии
+# 1 = adminDown, 2 = down, 3 = init, 4 = up
+OID_BFD_SESS_STATE = "1.3.6.1.2.1.222.1.2.1.8"
+
+BFD_STATE_UP = 4
+
+
+class BfdMonitor:
+    """Отслеживает состояние BFD-сессий и считает падения в скользящем окне.
+
+    Args:
+        host: IP-адрес роутера (R4).
+        window_sec: Длина скользящего окна в секундах (по умолчанию 5 минут).
+        max_flaps: Число падений при котором m4 = 0.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        window_sec: int = 300,
+        max_flaps: int = 5,
+    ) -> None:
+        self.host = host
+        self.window_sec = window_sec
+        self.max_flaps = max_flaps
+
+        # Храним timestamp каждого падения в скользящем окне
+        self._flap_times: deque[float] = deque()
+
+        # Последнее известное состояние каждой сессии {sess_index: state}
+        self._last_states: dict[int, int] = {}
+
+    async def poll(self) -> None:
+        """Опросить состояние всех BFD-сессий и зафиксировать падения.
+
+        Вызывается периодически из главного цикла.
+        """
+        states = await self._get_all_bfd_states()
+
+        for sess_index, state in states.items():
+            prev = self._last_states.get(sess_index)
+
+            # Фиксируем падение если сессия перешла из Up в Down
+            if prev == BFD_STATE_UP and state != BFD_STATE_UP:
+                logger.info("BFD сессия %d упала (state=%d)", sess_index, state)
+                self._flap_times.append(time.time())
+
+            self._last_states[sess_index] = state
+
+    def get_flap_count(self) -> int:
+        """Подсчитать падения в скользящем окне.
+
+        Устаревшие события (старше window_sec) удаляются.
+
+        Returns:
+            Число падений за последние window_sec секунд.
+        """
+        cutoff = time.time() - self.window_sec
+        while self._flap_times and self._flap_times[0] < cutoff:
+            self._flap_times.popleft()
+        return len(self._flap_times)
+
+    def get_m4(self) -> float:
+        """Вычислить метрику m4 на основе текущей истории падений.
+
+        Returns:
+            m4 в диапазоне [0.0, 1.0]. 1.0 = нет падений, 0.0 = max_flaps и более.
+        """
+        flaps = self.get_flap_count()
+        return max(0.0, 1.0 - flaps / self.max_flaps)
+
+    async def _get_all_bfd_states(self) -> dict[int, int]:
+        """Получить состояние всех BFD-сессий с роутера.
+
+        Returns:
+            Словарь {sess_index: state}.
+        """
+        try:
+            client = puresnmp.PyWrapper(puresnmp.Client(self.host, puresnmp.V2C("public")))
+            results = {}
+            async for oid, value in client.walk(OID_BFD_SESS_STATE):
+                # Последний элемент OID — индекс сессии
+                sess_index = int(str(oid).split(".")[-1])
+                results[sess_index] = int(value)
+            return results
+        except Exception as exc:
+            logger.warning("BFD SNMP ошибка для %s: %s", self.host, exc)
+            return {}

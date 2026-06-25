@@ -1,6 +1,9 @@
 import pytest
+import time
 from collectors.metric_collector import (
-    _parse_rtt, normalize_latency, normalize_load, normalize_loss
+    _parse_rtt, normalize_latency,
+    normalize_load, normalize_loss,
+    BfdMonitor,
 )
 from unittest.mock import AsyncMock, patch
 
@@ -201,3 +204,71 @@ class TestMeasureLoss:
 
         assert result is None
 
+class TestBfdMonitor:
+    """Тесты BfdMonitor — подсчёт падений и вычисление m4."""
+
+    def test_нет_падений_m4_единица(self):
+        """Нет падений → m4 = 1.0."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        assert monitor.get_m4() == pytest.approx(1.0)
+
+    def test_одно_падение(self):
+        """Одно падение из пяти → m4 = 0.8."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        monitor._flap_times.append(time.time())
+        assert monitor.get_m4() == pytest.approx(0.8)
+
+    def test_максимум_падений(self):
+        """max_flaps падений → m4 = 0.0."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+        for _ in range(5):
+            monitor._flap_times.append(time.time())
+        assert monitor.get_m4() == pytest.approx(0.0)
+
+    def test_старые_события_удаляются(self):
+        """Падения старше window_sec не считаются."""
+        monitor = BfdMonitor(host="10.0.44.1", window_sec=300, max_flaps=5)
+        # Добавляем старое событие (6 минут назад)
+        monitor._flap_times.append(time.time() - 400)
+        assert monitor.get_flap_count() == 0
+        assert monitor.get_m4() == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_poll_фиксирует_падение(self):
+        """poll() фиксирует падение когда сессия переходит из Up в Down."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+
+        # Первый опрос — сессия Up
+        with patch.object(
+            monitor, "_get_all_bfd_states", new_callable=AsyncMock,
+            return_value={1: 4},  # 4 = Up
+        ):
+            await monitor.poll()
+
+        assert monitor.get_flap_count() == 0
+
+        # Второй опрос — сессия упала в Down
+        with patch.object(
+            monitor, "_get_all_bfd_states", new_callable=AsyncMock,
+            return_value={1: 2},  # 2 = Down
+        ):
+            await monitor.poll()
+
+        assert monitor.get_flap_count() == 1
+        assert monitor.get_m4() == pytest.approx(0.8)
+
+    @pytest.mark.asyncio
+    async def test_poll_не_считает_повторный_down(self):
+        """Если сессия уже была Down — повторный Down не считается как новое падение."""
+        monitor = BfdMonitor(host="10.0.44.1", max_flaps=5)
+
+        # Устанавливаем начальное состояние — уже Down
+        monitor._last_states[1] = 2
+
+        with patch.object(
+            monitor, "_get_all_bfd_states", new_callable=AsyncMock,
+            return_value={1: 2},  # снова Down
+        ):
+            await monitor.poll()
+
+        assert monitor.get_flap_count() == 0
